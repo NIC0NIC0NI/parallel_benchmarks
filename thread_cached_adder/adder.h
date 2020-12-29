@@ -33,57 +33,69 @@ private:
     // TODO: use concurrent_stack or concurrent_queue
     std::mutex lock;
 };
-    
+
+#define CACHE_LINE 64
+
 template<typename Value>
 class Adder {
-    class PerThread {
+    class alignas(CACHE_LINE) PerThread {
     public:
-        PerThread() : value(0), next(nullptr), ref_count(2) {} // ref = {Adder, ObjectAggregate}
-        PerThread(std::atomic<PerThread*>& head) : value(0), next(nullptr), ref_count(2) {
+        PerThread(std::atomic<PerThread*>& head) : value(0), next(nullptr), adder_nref(false), aggregate_nref(false) {
+            Register(head);
+        }
+        void Register(std::atomic<PerThread*>& head) {
             PerThread* senti_next;
             do {
                 senti_next = head.load();        
                 this->next.store(senti_next);
             } while (!head.compare_exchange_strong(senti_next, this));
         }
-
         void add(Value v) {
             value.store(value.load() + v);
         }
         void reset() {
             value.store(0);
+            next.store(nullptr);
         }
-        static PerThread* create(std::atomic<PerThread*>& head) {
-            return new PerThread(head);
+        void aggregate_release() {
+            aggregate_nref = true;
+            if(adder_nref) {
+                delete this;
+            }
         }
-        void release() {
-            if(--ref_count == 0) {
+        void adder_release() {
+            adder_nref = true;
+            if(aggregate_nref) {
                 delete this;
             }
         }
     public:
         std::atomic<PerThread*> next;
         std::atomic<Value> value;
-        std::atomic<int>  ref_count;
+        std::atomic<bool>  adder_nref, aggregate_nref; // reference tags
     };
 
     class ObjectAggregate {
     public:
         ~ObjectAggregate() {
             for(auto p : handles) {
-                p->release();
+                p->aggregate_release();
             }
         }
         PerThread* get_instance(Adder* adder) {
             while(handles.size() <= adder->id) {
-                handles.push_back(PerThread::create(adder->head));
+                handles.push_back(new PerThread(adder->head));
             }
-            return handles[adder->id];
+            auto h = handles[adder->id];
+            if(h->adder_nref.load()) { // this ID is once free'd and allocated again
+                h->Register(adder->head);
+                h->adder_nref.store(false);
+            }
+            return h;
         }
     private:
         std::vector<PerThread*> handles;
     };
-
 
 public:
     Adder() : value(0), head(nullptr) {
@@ -94,7 +106,7 @@ public:
         while(p != nullptr) {
             auto next = p->next.load();
             p->reset();
-            p->release();
+            p->adder_release();
             p = next;
         }
         id_allocator.deallocate(id);
@@ -108,7 +120,6 @@ public:
     Value sum() {
 	    Value sum_value = value.load();
         auto next = head.load();
-        size_t i = 0;
         while(next != nullptr) {
             sum_value += next->value.load();
             next = next->next.load();
