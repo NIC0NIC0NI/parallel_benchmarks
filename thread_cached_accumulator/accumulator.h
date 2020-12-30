@@ -1,5 +1,5 @@
-#ifndef CONCURRENT_ADDER_H
-#define CONCURRENT_ADDER_H
+#ifndef CONCURRENT_accumulator_H
+#define CONCURRENT_accumulator_H
 
 #include <vector>
 #include <stack>
@@ -7,6 +7,8 @@
 #include <mutex>
 
 namespace concurrent {
+
+#define CACHE_LINE 64
 
 class IDAllocator {
 public:
@@ -34,24 +36,26 @@ private:
     std::mutex lock;
 };
 
-#define CACHE_LINE 64
 
 template<typename Value>
-class Adder {
-    class alignas(CACHE_LINE) PerThread {
+class Accumulator {
+public:
+    class alignas(CACHE_LINE) ThreadLocalInstance {
     public:
-        PerThread(std::atomic<PerThread*>& head) : value(0), next(nullptr), adder_nref(false), aggregate_nref(false) {
+        template<typename Operator>
+        void accumulate(Value v, const Operator& op) {
+            value.store(op(value.load(), v));
+        }
+    private:
+        ThreadLocalInstance(std::atomic<ThreadLocalInstance*>& head) : value(0), next(nullptr), accumulator_nref(false), aggregate_nref(false) {
             Register(head);
         }
-        void Register(std::atomic<PerThread*>& head) {
-            PerThread* senti_next;
+        void Register(std::atomic<ThreadLocalInstance*>& head) {
+            ThreadLocalInstance* senti_next;
             do {
                 senti_next = head.load();        
                 this->next.store(senti_next);
             } while (!head.compare_exchange_strong(senti_next, this));
-        }
-        void add(Value v) {
-            value.store(value.load() + v);
         }
         void reset() {
             value.store(0);
@@ -59,22 +63,24 @@ class Adder {
         }
         void aggregate_release() {
             aggregate_nref = true;
-            if(adder_nref) {
+            if(accumulator_nref) {
                 delete this;
             }
         }
-        void adder_release() {
-            adder_nref = true;
+        void accumulator_release() {
+            accumulator_nref = true;
             if(aggregate_nref) {
                 delete this;
             }
         }
-    public:
-        std::atomic<PerThread*> next;
+    private:
+        friend class ObjectAggregate;
+        friend class Accumulator;
+        std::atomic<ThreadLocalInstance*> next;
         std::atomic<Value> value;
-        std::atomic<bool>  adder_nref, aggregate_nref; // reference tags
+        std::atomic<bool>  accumulator_nref, aggregate_nref; // reference tags
     };
-
+private:
     class ObjectAggregate {
     public:
         ~ObjectAggregate() {
@@ -82,60 +88,60 @@ class Adder {
                 p->aggregate_release();
             }
         }
-        PerThread* get_instance(Adder* adder) {
-            while(handles.size() <= adder->id) {
-                handles.push_back(new PerThread(adder->head));
+        ThreadLocalInstance& get_instance(Accumulator* accumulator) {
+            while(handles.size() <= accumulator->id) {
+                handles.push_back(new ThreadLocalInstance(accumulator->head));
             }
-            auto h = handles[adder->id];
-            if(h->adder_nref.load()) { // this ID is once free'd and allocated again
-                h->Register(adder->head);
-                h->adder_nref.store(false);
+            auto h = handles[accumulator->id];
+            if(h->accumulator_nref.load()) { // this ID is once free'd and allocated again
+                h->Register(accumulator->head);
+                h->accumulator_nref.store(false);
             }
-            return h;
+            return *h;
         }
     private:
-        std::vector<PerThread*> handles;
+        std::vector<ThreadLocalInstance*> handles;
     };
-
 public:
-    Adder() : value(0), head(nullptr) {
+    Accumulator() : value(0), head(nullptr) {
         id = id_allocator.allocate();
     }
-    ~Adder() {
+    ~Accumulator() {
         auto p = head.load();
         while(p != nullptr) {
             auto next = p->next.load();
             p->reset();
-            p->adder_release();
+            p->accumulator_release();
             p = next;
         }
         id_allocator.deallocate(id);
     }
     
-    void add(Value value) {
-        thread_local ObjectAggregate aggregate;
-        aggregate.get_instance(this)->add(value);
-    }
-
-    Value sum() {
+    template<typename Operator>
+    Value result(Operator& op) {
 	    Value sum_value = value.load();
         auto next = head.load();
         while(next != nullptr) {
-            sum_value += next->value.load();
+            sum_value = op(sum_value, next->value.load());
             next = next->next.load();
         }
         return sum_value;
     }
 
+    ThreadLocalInstance& get_instance() {
+        thread_local ObjectAggregate aggregate;
+        return aggregate.get_instance(this);
+    }
+
 private:
-    std::atomic<PerThread*> head;
+    std::atomic<ThreadLocalInstance*> head;
     std::atomic<Value> value;
     size_t id;
     static IDAllocator id_allocator;
 };
 
 template<typename Value>
-IDAllocator Adder<Value>::id_allocator;
+IDAllocator Accumulator<Value>::id_allocator;
 }
 
 #endif
