@@ -47,7 +47,7 @@ public:
             value.store(op(value.load(), v));
         }
     private:
-        ThreadLocalInstance(std::atomic<ThreadLocalInstance*>& head) : value(0), next(nullptr), accumulator_nref(false), aggregate_nref(false) {
+        ThreadLocalInstance(std::atomic<ThreadLocalInstance*>& head) : value(0), next(nullptr), ref_count(2) {
             Register(head);
         }
         void Register(std::atomic<ThreadLocalInstance*>& head) {
@@ -61,15 +61,8 @@ public:
             value.store(0);
             next.store(nullptr);
         }
-        void aggregate_release() {
-            aggregate_nref = true;
-            if(accumulator_nref) {
-                delete this;
-            }
-        }
-        void accumulator_release() {
-            accumulator_nref = true;
-            if(aggregate_nref) {
+        void release() {
+            if((--ref_count) == 0) {
                 delete this;
             }
         }
@@ -78,14 +71,14 @@ public:
         friend class Accumulator;
         std::atomic<ThreadLocalInstance*> next;
         std::atomic<Value> value;
-        std::atomic<bool>  accumulator_nref, aggregate_nref; // reference tags
+        std::atomic<int>   ref_count;
     };
 private:
     class ObjectAggregate {
     public:
         ~ObjectAggregate() {
             for(auto p : handles) {
-                p->aggregate_release();
+                p->release();
             }
         }
         ThreadLocalInstance& get_instance(Accumulator* accumulator) {
@@ -93,9 +86,9 @@ private:
                 handles.push_back(new ThreadLocalInstance(accumulator->head));
             }
             auto h = handles[accumulator->id];
-            if(h->accumulator_nref.load()) { // this ID is once free'd and allocated again
+            if(h->ref_count.load() == 1) { // this ID is once free'd and allocated again
                 h->Register(accumulator->head);
-                h->accumulator_nref.store(false);
+                h->accumulator_nref.store(2);
             }
             return *h;
         }
@@ -111,7 +104,7 @@ public:
         while(p != nullptr) {
             auto next = p->next.load();
             p->reset();
-            p->accumulator_release();
+            p->release();
             p = next;
         }
         id_allocator.deallocate(id);
